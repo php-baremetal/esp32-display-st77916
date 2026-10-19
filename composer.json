@@ -1,0 +1,28 @@
+{
+    "name": "php-baremetal/esp32-display-st77916",
+    "description": "ST77916 QSPI round display driver for ext-spi (Baremetal\\Spi\\Driver\\St77916, an Output\\Display) over ESP-IDF's esp_lcd.",
+    "type": "bm-lib",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Gianfrancesco Aurecchia",
+            "email": "gianfri@aurecchia.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.3",
+        "php-baremetal/ext-spi": "^1.0",
+        "php-baremetal/esp32-spi-hal": "^1.0"
+    },
+    "extra": {
+        "baremetal": {
+            "idf-requires": [
+                "esp_lcd",
+                "esp_driver_gpio"
+            ],
+            "register": {
+                "spi_drivers": ["st77916_driver_desc"]
+            }
+        }
+    }
+}
