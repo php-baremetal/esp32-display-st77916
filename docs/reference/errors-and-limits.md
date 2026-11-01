@@ -27,7 +27,8 @@ the ESP-IDF error name (`esp_err_to_name()`).
 | `st77916 wake failed: ...` | `wake()` | The init sequence or orientation could not be sent. |
 | `Spi\Bus is not initialised` | constructor | The `Bus` object was created without its constructor running. |
 
-`\ValueError` (`must be between 1 and 4096`) is thrown for a `$width` or `$height` out of range.
+`\ValueError` (`must be between 1 and 4096`) is thrown for a `$width` or `$height` out of range, and
+`\ValueError` (`must be a GPIO number or -1`) for a `$cs`, `$rst` or `$bl` outside -1 to 255.
 
 ## Limits
 

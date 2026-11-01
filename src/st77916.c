@@ -113,6 +113,16 @@ static void st_release(st_state *s)
     }
 }
 
+/* Drive the backlight pin high (no-op without one). */
+static void st_backlight_on(st_state *s)
+{
+    if (s->bl >= 0) {
+        gpio_reset_pin(s->bl);
+        gpio_set_direction(s->bl, GPIO_MODE_OUTPUT);
+        gpio_set_level(s->bl, 1);
+    }
+}
+
 static esp_err_t st_hw_init(st_state *s, int host, int cs)
 {
     s->band_px = (size_t) s->width * FLUSH_BAND;
@@ -184,11 +194,7 @@ static esp_err_t st_hw_init(st_state *s, int host, int cs)
         return e;
     }
 
-    if (s->bl >= 0) {
-        gpio_reset_pin(s->bl);
-        gpio_set_direction(s->bl, GPIO_MODE_OUTPUT);
-        gpio_set_level(s->bl, 1);
-    }
+    st_backlight_on(s);
     return ESP_OK;
 }
 
@@ -327,6 +333,13 @@ PHP_METHOD(St77916, __construct)
         Z_PARAM_BOOL(invert)
     ZEND_PARSE_PARAMETERS_END();
 
+    if (!spi_check_device_args(2, cs, 0, 0, 0, 0)) {   /* the same CS range as ext-spi's constructors */
+        RETURN_THROWS();
+    }
+    if (rst < -1 || rst > 255 || bl < -1 || bl > 255) {
+        zend_argument_value_error((rst < -1 || rst > 255) ? 3 : 4, "must be a GPIO number or -1");
+        RETURN_THROWS();
+    }
     if (width < 1 || width > 4096 || height < 1 || height > 4096) {
         zend_argument_value_error((width < 1 || width > 4096) ? 5 : 6, "must be between 1 and 4096");
         RETURN_THROWS();
@@ -446,6 +459,7 @@ PHP_METHOD(St77916, wake)
         zend_throw_exception_ex(zend_ce_exception, 0, "st77916 wake failed: %s", esp_err_to_name(e));
         RETURN_THROWS();
     }
+    st_backlight_on(s);   /* the sleep may have released the pin too */
 }
 
 static const zend_function_entry st77916_methods[] = {
