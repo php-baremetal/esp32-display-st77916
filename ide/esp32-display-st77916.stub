@@ -1,0 +1,174 @@
+<?php
+// php-baremetal/esp32-display-st77916 1.1.0 — IDE helper, not loaded at runtime.
+
+namespace Baremetal\Spi\Driver {
+    /**
+     * An ST77916 QSPI round display, a panel of ext-display: extends Baremetal\Spi\Device and implements
+     * Baremetal\Output\Display.
+     *
+     * Colours are RGB565 integers (5 bits red, 6 green, 5 blue; 0x0000 black, 0xFFFF white); rgb() builds them.
+     * Drawing goes to a framebuffer that ext-display keeps for the panel; flush() starts sending it and returns
+     * at once, while the driver's flush task moves the bytes. The panel memory is not cleared at start-up, so
+     * draw the whole screen (or fill()) first. The class has every method of Baremetal\Output\Display (width(),
+     * height(), rgb(), clear(), pixel(), line(), rect(), fillRect(), circle(), fillCircle(), text(), textWidth(),
+     * image(), flush(), flushWait(), backlight(), sleep(), wake(), refreshRate(), onFlushed(), onVsync()),
+     * implemented by ext-display. The panel lives for the whole run; the inherited transfer(), write() and read()
+     * throw "SPI ... failed: ESP_ERR_INVALID_STATE", because the driver owns the wire. Any Output\Display method
+     * of an object whose constructor did not complete throws \Error "St77916 is not initialised".
+     */
+    class St77916 extends \Baremetal\Spi\Device implements \Baremetal\Output\Display
+    {
+        /**
+         * The panel's nominal refresh rate with this driver's init sequences, in Hz; what refreshRate() returns.
+         *
+         * The real rate drifts a little from it: give the driver the TE pin and use onVsync() to follow the
+         * panel's own frames.
+         */
+        public const REFRESH_HZ = 60.0;
+
+        /**
+         * Reserves the panel on its chip select and brings it up (first construction for a bus and CS only).
+         *
+         * The first construction allocates two ping-pong bands of $width x 20 pixels, pulses reset when $rst is
+         * not -1, picks one of two init sequences from the panel's ID register, sends the init sequence, applies
+         * the orientation, gaps and inversion, turns the display on, starts the flush task and drives the
+         * backlight high. Every construction gives the object its own framebuffer ($width x $height x 2 bytes,
+         * cleared to black). A later construction with the same bus, CS and arguments reuses the running panel;
+         * with any argument different it throws. After a failed init the next construction tries again.
+         *
+         * @param \Baremetal\Spi\Bus $bus A bus opened as QSPI: sclk, mosi (data 0), miso (data 1), data2 and data3.
+         * @param int $cs Chip-select GPIO number, -1 to 255.
+         * @param int $rst Reset GPIO number, pulsed at construction and by wake(); -1 when the reset line is not
+         *                 wired to a GPIO.
+         * @param int $bl Backlight GPIO number, driven high once the panel is on; -1 leaves the backlight alone
+         *                (backlight() then does nothing).
+         * @param int $width Width of the drawing area in pixels, 1 to 4096: the panel's width, or its height with
+         *                   $swap_xy.
+         * @param int $height Height of the drawing area in pixels, 1 to 4096: the panel's height, or its width
+         *                    with $swap_xy.
+         * @param int $x_gap Column offset of the visible area in the controller's memory, in pixels.
+         * @param int $y_gap Row offset of the visible area, in pixels.
+         * @param bool $mirror_x Mirror horizontally.
+         * @param bool $mirror_y Mirror vertically.
+         * @param bool $swap_xy Swap the axes; with a mirror this rotates the picture by 90 degrees. $width and
+         *                      $height are not swapped for you.
+         * @param bool $invert Invert colours, for panels wired with inverted polarity.
+         * @param int $te GPIO number of the panel's TE (tearing effect) output, -1 to 255; -1 when it is not wired.
+         *                ext-display attaches a falling-edge interrupt there, so a watch_gpio() on the same pin
+         *                takes it away from the display.
+         * @param bool $buffered Keep a second framebuffer ($width x $height x 2 bytes): flush() copies the region
+         *                       there and the panel reads the copy, so drawing never waits for a flush.
+         * @param bool $vsync Start every region at the next TE pulse, so a region shorter than one frame is not
+         *                    torn. Needs $te.
+         * @throws \ValueError "...: Argument #5 ($width) must be between 1 and 4096" or "...: Argument #6
+         *                     ($height) must be between 1 and 4096" when $width or $height is outside 1 to 4096;
+         *                     "must be a GPIO number or -1" for a $cs, $rst, $bl or $te outside -1 to 255;
+         *                     "Baremetal\Spi\Driver\St77916: vsync needs the TE pin (te:)" for $vsync with $te -1.
+         * @throws \Exception "Spi\Bus is not initialised", "cannot reserve st77916 (cs=N): ..." (the CS is held by
+         *                    another device, or no free device slot), "display on cs N already initialised with
+         *                    different parameters", "st77916 init failed: ..." (out of memory, or the panel could
+         *                    not be opened or initialised), or "st77916: cannot attach the drawing surface (error
+         *                    0x101)" (no memory for the framebuffer or its copy).
+         */
+        public function __construct(\Baremetal\Spi\Bus $bus, int $cs = 21, int $rst = 3, int $bl = -1, int $width = 360, int $height = 360, int $x_gap = 0, int $y_gap = 0, bool $mirror_x = false, bool $mirror_y = false, bool $swap_xy = false, bool $invert = false, int $te = -1, bool $buffered = false, bool $vsync = false) {}
+
+        /**
+         * Clears the whole screen to one colour and sends it: clear($color) followed by flush().
+         *
+         * @param int $color The RGB565 colour; the low 16 bits are used.
+         * @return void
+         * @throws \Exception What clear() and flush() throw, such as "St77916: flush timed out" or "St77916: push
+         *                    failed (error 0x107)".
+         */
+        public function fill(int $color): void {}
+
+        /**
+         * Opens the panel described by a block of the board the firmware was built for.
+         *
+         * The block must be of type st77916, with the keys sclk, d0, d1, d2, d3 (the QSPI bus), cs, rst, bl,
+         * width, height, the optional gap-x, gap-y, mirror-x, mirror-y, swap-xy (default 0) and te (the TE
+         * pin; -1 when missing). It opens a Baremetal\Spi\Bus on those pins on SPI host 1, then constructs the
+         * panel as new St77916($bus, cs, rst, bl, width, height, gap-x, gap-y, mirror-x, mirror-y, swap-xy,
+         * false, te, $buffered, $vsync).
+         *
+         * @param string $block The board block to read; another block name when a board describes more than one
+         *                      panel.
+         * @param bool $buffered The constructor's $buffered option.
+         * @param bool $vsync The constructor's $vsync option; the block needs a te key.
+         * @return St77916 The panel.
+         * @throws \RuntimeException "board '<id>' has no '<block>' block", "board '<id>' has a <block> of type
+         *                           '<type>', not 'st77916'", or "board '<id>': <block>.<key> is missing" (a
+         *                           required key is missing or not a number).
+         * @throws \ValueError "Baremetal\Spi\Driver\St77916: vsync needs the TE pin (te:)" for $vsync on a block
+         *                     without te, raised before the bus is opened; the errors of the constructor pass
+         *                     through.
+         * @throws \Exception The errors of new Bus() and of the constructor pass through unchanged.
+         */
+        public static function onboard(string $block = 'display', bool $buffered = false, bool $vsync = false): St77916 {}
+
+        // Baremetal\Output\Display, implemented by ext-display (the same declarations as its interface).
+
+        /** {@inheritDoc} */
+        public function width(): int {}
+
+        /** {@inheritDoc} */
+        public function height(): int {}
+
+        /** {@inheritDoc} */
+        public function rgb(int $r, int $g, int $b): int {}
+
+        /** {@inheritDoc} */
+        public function clear(int $color): void {}
+
+        /** {@inheritDoc} */
+        public function pixel(int $x, int $y, int $color): void {}
+
+        /** {@inheritDoc} */
+        public function line(int $x0, int $y0, int $x1, int $y1, int $color): void {}
+
+        /** {@inheritDoc} */
+        public function rect(int $x, int $y, int $w, int $h, int $color): void {}
+
+        /** {@inheritDoc} */
+        public function fillRect(int $x, int $y, int $w, int $h, int $color): void {}
+
+        /** {@inheritDoc} */
+        public function circle(int $cx, int $cy, int $r, int $color): void {}
+
+        /** {@inheritDoc} */
+        public function fillCircle(int $cx, int $cy, int $r, int $color): void {}
+
+        /** {@inheritDoc} */
+        public function text(int $x, int $y, string $s, int $color, ?int $bg = null, ?\Baremetal\Display\Font $font = null): int {}
+
+        /** {@inheritDoc} */
+        public function textWidth(string $s, ?\Baremetal\Display\Font $font = null): int {}
+
+        /** {@inheritDoc} */
+        public function image(int $x, int $y, int $w, int $h, string $pixels): void {}
+
+        /** {@inheritDoc} */
+        public function flush(?int $x0 = null, ?int $y0 = null, ?int $x1 = null, ?int $y1 = null): void {}
+
+        /** {@inheritDoc} */
+        public function flushWait(): void {}
+
+        /** {@inheritDoc} */
+        public function backlight(int $level): void {}
+
+        /** {@inheritDoc} */
+        public function sleep(): void {}
+
+        /** {@inheritDoc} */
+        public function wake(): void {}
+
+        /** {@inheritDoc} */
+        public function refreshRate(): float {}
+
+        /** {@inheritDoc} */
+        public function onFlushed(string $event): \Baremetal\Source {}
+
+        /** {@inheritDoc} */
+        public function onVsync(string $event): \Baremetal\Source {}
+    }
+}

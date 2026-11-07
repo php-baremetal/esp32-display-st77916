@@ -25,7 +25,8 @@
             "register": {
                 "spi_drivers": ["st77916_driver_desc"]
             },
-            "board-blocks": ["display:st77916"]
+            "board-blocks": ["display:st77916"],
+            "ide-stubs": ["ide/esp32-display-st77916.stub"]
         }
     }
 }

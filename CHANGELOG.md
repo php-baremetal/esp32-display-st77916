@@ -2,6 +2,7 @@
 
 ## 1.1.0
 
+- Added: ide/esp32-display-st77916.stub, the PHP declarations of the package for IDEs (conductor copies it into vendor/php-baremetal/ide-stubs/).
 - Added: asynchronous flush: `flush()` returns at once, and a flush task on core 1 sends the region through two
   ping-pong bands of 20 rows in internal RAM (the same memory as the 40-row band before), gathering one band
   while the other is in DMA.
