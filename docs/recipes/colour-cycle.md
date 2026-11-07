@@ -4,14 +4,14 @@ lede:    'The first thing to run on a new panel: bring it up and cycle full-scre
 see_also:
   - { href: '../usage/st77916.md', meta: 'PHP API' }
   - { href: '../reference/errors-and-limits.md', meta: 'Reference' }
-prev: { label: 'Errors, limits and light sleep', href: '../reference/errors-and-limits.md' }
+prev: { label: 'Errors, limits and sleep', href: '../reference/errors-and-limits.md' }
 next: { label: 'Draw bars', href: './draw-bars.md' }
 ---
 
 # Cycle colours
 
-The ST77916 panel of a Waveshare ESP32-S3-Touch-LCD-1.85B: QSPI on SCLK 40 and data lines 46, 45, 42, 41, CS 21,
-reset 3, backlight 5. On another board, change the board id and the pins.
+The ST77916 panel of a Waveshare ESP32-S3-Touch-LCD-1.85B, opened with `onboard()` from the board's `display`
+block. On a board without that block, use the constructor with your pins (see [St77916](../usage/st77916.md)).
 
 <!-- @code-block language="json" label="composer.json" -->
 ```json
@@ -45,18 +45,16 @@ reset 3, backlight 5. On another board, change the board id and the pins.
 <!-- @code-block language="php" label="project-src/index.php" -->
 ```php
 <?php
-use Baremetal\Spi\Bus;
 use Baremetal\Spi\Driver\St77916;
 
-$bus = new Bus(sclk: 40, mosi: 46, miso: 45, data2: 42, data3: 41);   // mosi = D0, miso = D1
-$lcd = new St77916($bus, cs: 21, rst: 3, bl: 5, width: 360, height: 360);
+$lcd = St77916::onboard();
 
 function loop(int $tick): void
 {
     global $lcd;
 
     $colors = [$lcd->rgb(255, 0, 0), $lcd->rgb(0, 255, 0), $lcd->rgb(0, 0, 255), $lcd->rgb(255, 255, 255)];
-    $lcd->fill($colors[$tick % 4]);
+    $lcd->fill($colors[$tick % 4]);   // clear() + flush()
     delay(1000);
 }
 ```
@@ -66,9 +64,12 @@ The panel turns red, green, blue and white, one second each, for as long as the 
 
 ## When it fails
 
-- **Black panel, no exception**: the backlight pin is wrong or `bl` was left at `-1`.
-- **Wrong colours or a shifted picture**: try `invert: true`, or set `x_gap` / `y_gap` for a panel whose
-  visible area does not start at the controller's origin.
+- **`board '...' has no 'display' block`**: the project's board has no panel description; pass the bus and pins
+  to the constructor instead.
+- **Black panel, no exception**: the backlight pin is wrong, or `bl` is `-1`.
+- **Wrong colours or a shifted picture**: try `invert: true` with the constructor, or set the gaps (`gap-x`,
+  `gap-y` in the board, `x_gap`, `y_gap` in the constructor) for a panel whose visible area does not start at the
+  controller's origin.
 - **`cannot open SPI host 1: ...`**: the host is taken; see ext-spi's Bus page on its
   [package page](package:php-baremetal/ext-spi).
 - **`st77916 init failed: ESP_ERR_NO_MEM`**: not enough DMA-capable internal RAM for the band buffer
