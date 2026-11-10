@@ -48,6 +48,7 @@ typedef struct {
     uint8_t fb_bits_per_pixel;
     uint8_t madctl_val; // save current value of LCD_CMD_MADCTL register
     uint8_t colmod_val; // save surrent value of LCD_CMD_COLMOD register
+    int caset[2];       // the column window last sent (CASET), caset[0] > caset[1] when unknown
     const st77916_lcd_init_cmd_t *init_cmds;
     uint16_t init_cmds_size;
     struct {
@@ -64,6 +65,8 @@ esp_err_t esp_lcd_new_panel_st77916(const esp_lcd_panel_io_handle_t io, const es
     st77916_panel_t *st77916 = NULL;
     st77916 = calloc(1, sizeof(st77916_panel_t));
     ESP_GOTO_ON_FALSE(st77916, ESP_ERR_NO_MEM, err, TAG, "no mem for st77916 panel");
+    st77916->caset[0] = 1;   // unknown
+    st77916->caset[1] = 0;
 
     if (panel_dev_config->reset_gpio_num >= 0) {
         gpio_config_t io_conf = {
@@ -137,6 +140,10 @@ err:
 
 static esp_err_t tx_param(st77916_panel_t *st77916, esp_lcd_panel_io_handle_t io, int lcd_cmd, const void *param, size_t param_size)
 {
+    if (lcd_cmd != LCD_CMD_RASET) {
+        st77916->caset[0] = 1;   // any other command (a reset, the init sequence...) may change the columns
+        st77916->caset[1] = 0;
+    }
     if (st77916->flags.use_qspi_interface) {
         lcd_cmd &= 0xff;
         lcd_cmd <<= 8;
@@ -941,13 +948,18 @@ static esp_err_t panel_st77916_draw_bitmap(esp_lcd_panel_t *panel, int x_start, 
     y_start += st77916->y_gap;
     y_end += st77916->y_gap;
 
-    // define an area of frame memory where MCU can access
-    ESP_RETURN_ON_ERROR(tx_param(st77916, io, LCD_CMD_CASET, (uint8_t[]) {
-        (x_start >> 8) & 0xFF,
-        x_start & 0xFF,
-        ((x_end - 1) >> 8) & 0xFF,
-        (x_end - 1) & 0xFF,
-    }, 4), TAG, "send command failed");
+    // define an area of frame memory where MCU can access; the columns only when they changed (the bands of one
+    // region share them, and each command costs a transfer of its own)
+    if (st77916->caset[0] != x_start || st77916->caset[1] != x_end - 1) {
+        ESP_RETURN_ON_ERROR(tx_param(st77916, io, LCD_CMD_CASET, (uint8_t[]) {
+            (x_start >> 8) & 0xFF,
+            x_start & 0xFF,
+            ((x_end - 1) >> 8) & 0xFF,
+            (x_end - 1) & 0xFF,
+        }, 4), TAG, "send command failed");
+        st77916->caset[0] = x_start;
+        st77916->caset[1] = x_end - 1;
+    }
     ESP_RETURN_ON_ERROR(tx_param(st77916, io, LCD_CMD_RASET, (uint8_t[]) {
         (y_start >> 8) & 0xFF,
         y_start & 0xFF,

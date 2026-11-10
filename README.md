@@ -65,6 +65,19 @@ $lcd = St77916::onboard(vsync: true);   // each flush() starts at the panel's ne
 The TE pin belongs to the display: ext-display attaches its interrupt there, so a `watch_gpio()` on the same pin
 takes it away from the display.
 
+## Band path
+
+Since 1.2 the driver also offers the band path of ext-display 1.1, for renderers such as Slate that compose a picture
+outside the framebuffer and send it band by band (it requires `php-baremetal/ext-display` `^1.1`). Bands are 40 rows
+of at most 360 pixels (28 800 bytes) in DMA-capable internal RAM that the driver allocates, and the panel keeps its
+picture, so a renderer sends only what changed. The flush task of the asynchronous flush sends them, in order, and
+runs each band's `done` once its transfer ended. The band path never waits for the TE pulse: a renderer paces its
+frames on `onVsync()` itself; the driver tells it the order of the panel's refresh (top to bottom, bottom to top
+with `mirror_y`, across the columns with `swap_xy`), so that it can write without tearing. After a transfer timeout the panel is marked failed: every later band op returns
+`ESP_ERR_INVALID_STATE`, which the renderer takes as final. `sleep()` and `wake()` run after the bands already
+accepted, and `wake()` tells the renderer to send its whole frame again. The surface's own `flush()` does not use this path,
+and it does not run while a renderer holds the panel.
+
 ## Documentation
 
 - [Overview](docs/overview.md): requirements, install, a first project, how it registers.

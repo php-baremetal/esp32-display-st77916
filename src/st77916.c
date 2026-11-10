@@ -44,6 +44,12 @@
  * never blocks: it also runs in the flush task (display_job_done() begins the pending region) and in the TE
  * interrupt, and a blocking send from the flush task onto its own full queue would deadlock it. */
 #define JOB_QUEUE_LEN   4
+/* Bands of the band path accepted and not yet done (the contract asks for at least 2). They share the job queue with
+ * the flush jobs, which is sized for both: a band takes a slot first, so its send never finds the queue full. */
+#define BAND_SLOTS      3
+/* push blocks this long for a free slot before it gives up with ESP_ERR_TIMEOUT: a deliberate bound on the contract's
+ * "blocks until it can", against a stuck task. */
+#define BAND_ACCEPT_TIMEOUT_MS 5000
 #define TASK_STACK      3072
 #define TASK_CORE       1
 #define IO_HZ           (40 * 1000 * 1000)
@@ -53,6 +59,21 @@
 
 extern const spi_driver_desc_t st77916_driver_desc;
 
+/* What the flush task takes from its queue: a region of the surface (display_job_t), a band of the band path, or
+ * the stop request. */
+typedef enum { ST_JOB_FLUSH, ST_JOB_BAND, ST_JOB_STOP } st_job_kind_t;
+
+typedef struct {
+    st_job_kind_t kind;
+    display_job_t flush;               /* ST_JOB_FLUSH */
+    struct {                           /* ST_JOB_BAND */
+        int x0, x1, y0, rows;
+        const void *px;
+        void (*done)(void *arg);
+        void *arg;
+    } band;
+} st_job_t;
+
 /* The panel's nominal refresh rate with the init sequences of this driver; not measured. */
 #define ST_REFRESH_HZ 60.0f
 
@@ -60,14 +81,19 @@ typedef struct {
     esp_lcd_panel_io_handle_t io;
     esp_lcd_panel_handle_t panel;
     SemaphoreHandle_t done;          /* given once per finished color transfer */
-    uint16_t *band[2];               /* DMA-capable internal, width * FLUSH_ROWS pixels each */
+    uint16_t *band[2];               /* DMA-capable internal, width * FLUSH_ROWS pixels each; at the first region
+                                      * that needs them (st_bands), never on the band path */
     size_t band_px;
-    QueueHandle_t jobs;              /* JOB_QUEUE_LEN display_job_t; a job with x0 < 0 stops the task */
+    QueueHandle_t jobs;              /* JOB_QUEUE_LEN + BAND_SLOTS st_job_t */
+    SemaphoreHandle_t slots;         /* counting, BAND_SLOTS: a band holds one from push until after its done */
+    bool band_open;                  /* band path: begin() was called and end() not yet (the renderer's task only) */
+    int  band_x0, band_y0, band_x1, band_y1;
     SemaphoreHandle_t progress;      /* binary, given after each band and after each job */
     SemaphoreHandle_t gone;          /* given by the task when it ends */
     TaskHandle_t task;
     int  te;                         /* GPIO of the panel's TE output, -1 for none; ext-display owns it */
     display_panel_ops_t ops;
+    display_band_ops_t band_ops;     /* st_band_ops with this panel's scan order */
     int  width, height;
     int  x_gap, y_gap;
     int  rst, bl;
@@ -79,6 +105,9 @@ typedef struct {
     bool bl_ready;                   /* the backlight pin is configured as an output */
 } st_state;
 
+/* The DMA of a color transfer ended (SPI interrupt). esp_lcd's SPI IO drops this callback's return value, so the
+ * switch to the flush task is asked for here: without it the task would only run at the next tick (up to 1 ms
+ * later), and every band would wait for it. */
 static IRAM_ATTR bool st_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *ev,
                                     void *ctx)
 {
@@ -86,6 +115,9 @@ static IRAM_ATTR bool st_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_
     (void) ev;
     BaseType_t woken = pdFALSE;
     xSemaphoreGiveFromISR((SemaphoreHandle_t) ctx, &woken);
+    if (woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
     return woken == pdTRUE;
 }
 
@@ -125,7 +157,7 @@ static void st_task_stop(st_state *s)
         return;
     }
     display_quiesce(s);
-    display_job_t stop = { .x0 = -1 };
+    st_job_t stop = { .kind = ST_JOB_STOP };
     xQueueSend(s->jobs, &stop, portMAX_DELAY);
     xSemaphoreTake(s->gone, portMAX_DELAY);
     s->task = NULL;
@@ -152,7 +184,7 @@ static void st_release(st_state *s)
         vQueueDelete(s->jobs);
         s->jobs = NULL;
     }
-    SemaphoreHandle_t *sems[] = { &s->done, &s->progress, &s->gone };
+    SemaphoreHandle_t *sems[] = { &s->done, &s->progress, &s->gone, &s->slots };
     for (size_t i = 0; i < sizeof sems / sizeof sems[0]; i++) {
         if (*sems[i]) {
             vSemaphoreDelete(*sems[i]);
@@ -185,6 +217,22 @@ static bm_err_t st_band_done(st_state *s)
             s->failed = true;
         }
         return ESP_ERR_TIMEOUT;
+    }
+    return BM_OK;
+}
+
+/* The ping-pong pair, allocated by the first region that goes through it: a renderer on the band path (Slate) never
+ * flushes the surface, and 2 x 14 400 bytes of internal RAM held from the constructor would sit unused. Called by the
+ * flush task, or by st_push() while no job is in flight; kept until the panel is released. */
+static bm_err_t st_bands(st_state *s)
+{
+    for (int i = 0; i < 2; i++) {
+        if (!s->band[i]) {
+            s->band[i] = heap_caps_malloc(s->band_px * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+            if (!s->band[i]) {
+                return ESP_ERR_NO_MEM;
+            }
+        }
     }
     return BM_OK;
 }
@@ -226,6 +274,10 @@ static bm_err_t st_send_job(st_state *s, const display_job_t *j)
         }
         return BM_OK;
     }
+    bm_err_t be = st_bands(s);
+    if (be != BM_OK) {
+        return be;
+    }
     int rows = (int) (s->band_px / (size_t) w);
     int k = 0, prev_end = -1;
     for (int y = j->y0; y < j->y1; y += rows, k++) {
@@ -252,22 +304,47 @@ static bm_err_t st_send_job(st_state *s, const display_job_t *j)
     return e;
 }
 
-/* The flush task: one job at a time from the queue, then display_job_done() (which may begin the pending
- * region) and a progress signal once the engine's callbacks returned. */
+/* One band of the band path: the band goes out and its DMA is waited for. The band path never waits for the TE
+ * pulse: a renderer paces its frames on onVsync() itself. done(arg) is called either way (a failed transfer or a failed panel included): the
+ * push accepted the band. The caller frees the slot after it. */
+static void st_send_band(st_state *s, const st_job_t *j)
+{
+    if (!s->failed) {
+        xQueueReset(s->done);
+        esp_err_t e = esp_lcd_panel_draw_bitmap(s->panel, j->band.x0, j->band.y0, j->band.x1,
+                                                j->band.y0 + j->band.rows, j->band.px);
+        if (e == ESP_OK) {
+            st_band_done(s);   /* a timeout fails the panel (s->failed) when the DMA never ends */
+        }
+    }
+    if (j->band.done) {
+        j->band.done(j->band.arg);
+    }
+}
+
+/* The flush task: one job at a time from the queue. A region of the surface ends with display_job_done() (which
+ * may begin the pending region) and a progress signal once the engine's callbacks returned; a band of the band path
+ * ends with its done(), here and never in the DMA interrupt, then frees its slot. */
 static void st_flush_task(void *arg)
 {
     st_state *s = arg;
-    display_job_t j;
+    st_job_t j;
     for (;;) {
         if (xQueueReceive(s->jobs, &j, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        if (j.x0 < 0) {
+        if (j.kind == ST_JOB_STOP) {
             break;
         }
+        if (j.kind == ST_JOB_BAND) {
+            st_send_band(s, &j);
+            xSemaphoreGive(s->slots);
+            xSemaphoreGive(s->progress);
+            continue;
+        }
         int64_t t0 = esp_timer_get_time();
-        bm_err_t e = st_send_job(s, &j);
-        display_job_done(&j, e, (uint32_t) (esp_timer_get_time() - t0));
+        bm_err_t e = st_send_job(s, &j.flush);
+        display_job_done(&j.flush, e, (uint32_t) (esp_timer_get_time() - t0));
         xSemaphoreGive(s->progress);
     }
     xSemaphoreGive(s->gone);
@@ -278,13 +355,14 @@ static void st_flush_task(void *arg)
 static bool st_begin(void *panel, const display_job_t *job)
 {
     st_state *s = panel;
+    st_job_t j = { .kind = ST_JOB_FLUSH, .flush = *job };
     if (xPortInIsrContext()) {
         BaseType_t woken = pdFALSE;
-        bool ok = xQueueSendFromISR(s->jobs, job, &woken) == pdTRUE;
+        bool ok = xQueueSendFromISR(s->jobs, &j, &woken) == pdTRUE;
         portYIELD_FROM_ISR(woken);
         return ok;
     }
-    return xQueueSend(s->jobs, job, 0) == pdTRUE;
+    return xQueueSend(s->jobs, &j, 0) == pdTRUE;
 }
 
 /* ops->wait: until a band or a job of this panel ends, or ms pass. */
@@ -297,15 +375,13 @@ static bool st_wait(void *panel, uint32_t ms)
 
 static esp_err_t st_hw_init(st_state *s, int host, int cs)
 {
-    s->band_px = (size_t) s->width * FLUSH_ROWS;
-    for (int i = 0; i < 2; i++) {
-        s->band[i] = heap_caps_malloc(s->band_px * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    }
+    s->band_px = (size_t) s->width * FLUSH_ROWS;   /* the bands themselves: st_bands(), at the first region */
     s->done = xSemaphoreCreateCounting(64, 0);
-    s->jobs = xQueueCreate(JOB_QUEUE_LEN, sizeof(display_job_t));
+    s->jobs = xQueueCreate(JOB_QUEUE_LEN + BAND_SLOTS, sizeof(st_job_t));
+    s->slots = xSemaphoreCreateCounting(BAND_SLOTS, BAND_SLOTS);
     s->progress = xSemaphoreCreateBinary();
     s->gone = xSemaphoreCreateBinary();
-    if (!s->band[0] || !s->band[1] || !s->done || !s->jobs || !s->progress || !s->gone) {
+    if (!s->done || !s->jobs || !s->slots || !s->progress || !s->gone) {
         st_release(s);
         return ESP_ERR_NO_MEM;
     }
@@ -401,6 +477,12 @@ static bm_err_t st_push(void *panel, int x0, int y0, int x1, int y1, const void 
     bool direct = esp_ptr_dma_capable(px) && ((uintptr_t) px & 3u) == 0;
     int rows = direct ? y1 - y0 : (int) (s->band_px / (size_t) w);
     const uint8_t *src = px;
+    if (!direct) {
+        bm_err_t be = st_bands(s);
+        if (be != BM_OK) {
+            return be;
+        }
+    }
 
     xQueueReset(s->done);
     for (int y = y0; y < y1; y += rows) {
@@ -422,6 +504,130 @@ static bm_err_t st_push(void *panel, int x0, int y0, int x1, int y1, const void 
     return BM_OK;
 }
 
+/* The band path (display_band_ops_t of ext-display 1.1). The renderer's task calls these; the flush task sends the
+ * bands, in the order of push, through the same queue as the regions of the surface. */
+#define BAND_ROWS 40
+/* The ST77916 is a 360-wide part: a panel wider than that cannot take full-width 40-row bands. */
+#define BAND_BYTES_MAX (360 * BAND_ROWS * sizeof(uint16_t))
+
+static void *st_band_alloc(void *panel, size_t bytes)
+{
+    (void) panel;
+    if (bytes == 0 || bytes > BAND_BYTES_MAX) {
+        return NULL;
+    }
+    return heap_caps_malloc(bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+}
+
+static void st_band_free(void *panel, void *px)
+{
+    (void) panel;
+    heap_caps_free(px);
+}
+
+/* The window of every band is set by its esp_lcd_panel_draw_bitmap(); begin only checks and remembers the region. */
+static bm_err_t st_band_begin(void *panel, int x0, int y0, int x1, int y1)
+{
+    st_state *s = panel;
+    if (s->failed) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (x0 < 0 || y0 < 0 || x1 <= x0 || y1 <= y0 || x1 > s->width || y1 > s->height) {
+        return BM_ERR_INVALID_ARG;
+    }
+    s->band_x0 = x0;
+    s->band_y0 = y0;
+    s->band_x1 = x1;
+    s->band_y1 = y1;
+    s->band_open = true;
+    return BM_OK;
+}
+
+/* Takes a slot (blocking while BAND_SLOTS bands are in flight), queues the band for the flush task and returns. An
+ * error leaves nothing queued and no slot held, so no done will run. */
+static bm_err_t st_band_push(void *panel, int y0, int rows, const void *px, void (*done)(void *arg), void *arg)
+{
+    st_state *s = panel;
+    if (s->failed) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s->band_open || !px || rows < 1 || y0 < s->band_y0 || y0 + rows > s->band_y1 ||
+        (size_t) rows * (size_t) (s->band_x1 - s->band_x0) * sizeof(uint16_t) > BAND_BYTES_MAX) {
+        return BM_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s->slots, pdMS_TO_TICKS(BAND_ACCEPT_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    st_job_t j = {
+        .kind = ST_JOB_BAND,
+        .band = { .x0 = s->band_x0, .x1 = s->band_x1, .y0 = y0, .rows = rows, .px = px, .done = done, .arg = arg },
+    };
+    if (xQueueSend(s->jobs, &j, 0) != pdTRUE) {
+        xSemaphoreGive(s->slots);
+        return ESP_ERR_NO_MEM;
+    }
+    return BM_OK;
+}
+
+/* Every band was given to push: nothing to flush, and the done callbacks are not waited for. */
+static bm_err_t st_band_end(void *panel)
+{
+    st_state *s = panel;
+    s->band_open = false;
+    return BM_OK;
+}
+
+/* The order in which the panel refreshes its picture, in the coordinates of the band path. The controller reads its
+ * RAM row 0 first after each TE pulse (MADCTL ML = 0, as this driver's init sequences leave it); the orientation
+ * maps our rows onto its RAM: mirror_y (MADCTL MY) turns them over, swap_xy (MV) makes them columns.
+ * ST77916_SCAN_REVERSED=1 at build time reverses the result, for a panel module whose RAM is read the other way. */
+#ifndef ST77916_SCAN_REVERSED
+#define ST77916_SCAN_REVERSED 0
+#endif
+
+static display_scan_t st_scan(const st_state *s)
+{
+    bool rev = s->mirror_y != (ST77916_SCAN_REVERSED != 0);
+    if (s->swap_xy) {
+        return rev ? DISPLAY_SCAN_RIGHT_LEFT : DISPLAY_SCAN_LEFT_RIGHT;
+    }
+    return rev ? DISPLAY_SCAN_BOTTOM_UP : DISPLAY_SCAN_TOP_DOWN;
+}
+
+static const display_band_ops_t st_band_ops = {
+    .rows = BAND_ROWS,
+    .bytes_max = BAND_BYTES_MAX,
+    .own_ram = true,   /* the panel keeps its picture */
+    .buf_alloc = st_band_alloc,
+    .buf_free = st_band_free,
+    .begin = st_band_begin,
+    .push = st_band_push,
+    .end = st_band_end,
+};
+
+/* Waits until the bands already accepted are sent and their done ran, and keeps every slot: a push from the renderer
+ * meanwhile blocks, and goes after the sleep or wake that called this. The caller gives the slots back with
+ * st_band_resume(), on every path. On a timeout it holds none. */
+static bm_err_t st_band_drain(st_state *s)
+{
+    for (int got = 0; got < BAND_SLOTS; got++) {
+        if (xSemaphoreTake(s->slots, pdMS_TO_TICKS(BAND_ACCEPT_TIMEOUT_MS)) != pdTRUE) {
+            while (got-- > 0) {
+                xSemaphoreGive(s->slots);
+            }
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+    return BM_OK;
+}
+
+static void st_band_resume(st_state *s)
+{
+    for (int i = 0; i < BAND_SLOTS; i++) {
+        xSemaphoreGive(s->slots);
+    }
+}
+
 /* On/off only: there is no PWM on the backlight pin. */
 static bm_err_t st_backlight(void *panel, int level)
 {
@@ -433,9 +639,8 @@ static bm_err_t st_backlight(void *panel, int level)
 
 /* sleep: display off, backlight off. wake: re-initialise the panel (a light sleep may have disturbed the QSPI
  * lines), backlight back on, and have the next flush() send the full frame. */
-static bm_err_t st_sleep(void *panel, bool on)
+static bm_err_t st_sleep_locked(st_state *s, bool on)
 {
-    st_state *s = panel;
     display_quiesce(s);   /* another surface on this panel may still be sending: esp_lcd's IO is not shared */
     if (on) {
         esp_err_t e = esp_lcd_panel_disp_on_off(s->panel, false);
@@ -457,6 +662,18 @@ static bm_err_t st_sleep(void *panel, bool on)
     st_backlight_set(s, s->bl_on);
     display_invalidate(s);
     return BM_OK;
+}
+
+static bm_err_t st_sleep(void *panel, bool on)
+{
+    st_state *s = panel;
+    bm_err_t e = st_band_drain(s);   /* the bands of a renderer first; its pushes wait until we are done */
+    if (e != BM_OK) {
+        return e;
+    }
+    e = st_sleep_locked(s, on);
+    st_band_resume(s);
+    return e;
 }
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_st_ctor, 0, 0, 1)
@@ -570,11 +787,14 @@ PHP_METHOD(St77916, __construct)
         s->te = (int) te;
         s->buffered = buffered;
         s->vsync = vsync;
+        s->band_ops = st_band_ops;
+        s->band_ops.scan = st_scan(s);
         s->ops = (display_panel_ops_t){
             .width = (uint16_t) width, .height = (uint16_t) height, .format = DISPLAY_FORMAT_RGB565,
             .refresh_hz = ST_REFRESH_HZ,
             .push = st_push, .backlight = bl >= 0 ? st_backlight : NULL, .sleep = st_sleep,
             .begin = st_begin, .wait = st_wait,
+            .band = &s->band_ops,
         };
         esp_err_t e = st_hw_init(s, bo->bus->host, (int) cs);
         if (e != ESP_OK) {
